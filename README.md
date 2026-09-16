@@ -1,5 +1,8 @@
 # Ledgerly
 
+[![CI](https://github.com/ShehabDawiri/Ledgerly/actions/workflows/ci.yml/badge.svg)](https://github.com/ShehabDawiri/Ledgerly/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A toy bank ledger that stays correct under concurrent load.
 
 Money moves between accounts, and the service guarantees three things while hundreds of
@@ -30,6 +33,7 @@ that proves each one actually fires rather than merely existing.
 - [Running with PostgreSQL](#running-with-postgresql)
 - [Testing](#testing)
 - [Project structure](#project-structure)
+- [Design notes](#design-notes)
 - [Security considerations](#security-considerations)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -633,12 +637,117 @@ on each other, `account` declares the port and `transfer` implements it
 ### The two-bean split
 
 `TransferService` (retry loop, no transaction) and `TransferExecutor` (`@Transactional`, no
-retry) are separate beans because Spring's `@Transactional` is proxy-based: a call between
-two methods of the same class silently bypasses it. Merging them would quietly remove the
-transaction boundary — and the atomicity the whole design depends on — with no compiler or
-runtime error. This split is load-bearing; don't collapse it.
+retry) are separate beans on purpose, and merging them would silently remove the transaction
+boundary the whole design depends on. This split is load-bearing; don't collapse it. The
+reason is worth reading in full — see
+[Self-invocation silently disables `@Transactional`](#self-invocation-silently-disables-transactional).
 
 ---
+
+## Design notes
+
+Things this project got wrong first, kept notes on, and fixed.
+
+### Self-invocation silently disables `@Transactional`
+
+The original `TransferService` called its own transactional method from another method of
+the same class. It compiled, it ran, the tests I had at the time passed — and **no
+transaction was ever opened**:
+
+```java
+@Service
+public class TransferService {
+
+    public TransferResult transfer(TransferRequest request) {
+        // ...
+        return transferWithRetry(from, to, request.amount());  // call on `this`
+    }
+
+    @Retry(name = "transferRetry")
+    public TransferResult transferWithRetry(Account from, Account to, BigDecimal amount) {
+        return doActualTransfer(from, to, amount);             // call on `this`
+    }
+
+    @Transactional
+    public TransferResult doActualTransfer(Account from, Account to, BigDecimal amount) {
+        // debit, credit, two event rows — none of it inside a transaction
+    }
+}
+```
+
+Both annotations were dead. The debit, the credit and the event writes each committed in
+their own implicit transaction, so a failure partway through could leave money moved with no
+matching events — the exact corruption the ledger is supposed to make impossible.
+
+**Why it happens.** Spring implements `@Transactional`, `@Retry`, `@Cacheable` and friends
+with proxies. At startup it wraps the bean, and everything else in the container is handed
+the *proxy*, not your object. A call arriving from outside — from a controller, say — passes
+through that wrapper, which opens the transaction, calls your method, then commits. But a
+call from one method to another inside the same class is an ordinary Java invocation on
+`this`: the real object, not the wrapper. Nothing intercepts it. The annotation is still
+sitting there in the source, and nobody is reading it.
+
+There is no error for this. No warning, no startup failure, no log line. The only symptom is
+behaviour you assumed you had and don't.
+
+**The fix.** Move the annotated method onto its own bean and inject it, so the call crosses a
+real bean boundary and therefore a real proxy:
+
+```java
+@Service
+public class TransferService {
+
+    private final TransferExecutor executor;   // injected — a different bean
+
+    public TransferResult transfer(TransferRequest request) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return executor.executeOnce(request);   // goes through the proxy
+            } catch (ConcurrencyFailureException e) {
+                if (attempt >= maxAttempts) throw e;
+                backoff(attempt);
+            }
+        }
+    }
+}
+
+@Service
+public class TransferExecutor {
+
+    @Transactional                                      // now genuinely applied
+    public TransferResult executeOnce(TransferRequest request) {
+        // debit, credit, two events, idempotency row — all or nothing
+    }
+}
+```
+
+The retry did not get the same treatment. `@Retry` was dropped for a plain loop, because a
+retry has to *wrap* the transaction: the optimistic-lock failure is thrown at commit, inside
+the proxy, after `executeOnce()` has already returned, so it can only be caught from outside
+that boundary. Annotating the retry would have meant a third bean and a proxy ordering I'd
+have to keep correct forever, to buy less than the ten lines the loop costs.
+
+**How to catch it.** The tell is any `@Transactional`, `@Async`, `@Retry` or `@Cacheable`
+method invoked from within its own class. To confirm at runtime, ask the transaction
+interceptor to narrate itself:
+
+```bash
+./gradlew bootRun --args='--logging.level.org.springframework.transaction.interceptor=TRACE'
+```
+
+Then send a transfer and look for the method in the log:
+
+```
+TRACE o.s.t.i.TransactionInterceptor : Getting transaction for [...TransferExecutor.executeOnce]
+TRACE o.s.t.i.TransactionInterceptor : Completing transaction for [...TransferExecutor.executeOnce]
+```
+
+If the method demonstrably ran and those lines never appear, the proxy was bypassed. That
+absence is the entire bug — which is what makes it so easy to ship.
+
+Worth knowing because "add the annotation" is only half the model. The other half is that
+these annotations are not language features; they're interception, and interception has a
+boundary you can accidentally stand inside of.
 
 ## Security considerations
 
