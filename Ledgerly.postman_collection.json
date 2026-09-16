@@ -1,0 +1,1147 @@
+{
+  "info": {
+    "name": "Ledgerly",
+    "_postman_id": "9f3c2b41-0d5e-4a77-9d1c-6b8e2f0a4c11",
+    "description": "Ledgerly - a toy bank ledger that stays correct under concurrent load.\n\n**Run the folders in order** (Accounts -> Transfers -> Reconciliation -> Error cases), or hit Run collection: the first request captures the seeded account ids into collection variables that everything else depends on.\n\nStart the app with `./gradlew bootRun` (defaults to http://localhost:8080). If you changed the port, edit the `baseUrl` collection variable.\n\nDemo path for an interview:\n1. `List accounts` - note the balances and the `version` field.\n2. `Transfer money` - money moves, one transferId returned.\n3. `Replay the same request` - identical response, nothing appended to the ledger.\n4. `List transfer events` - exactly two new rows, one DEBIT and one CREDIT.\n5. `Reconcile the ledger` - every balance re-derived from the log, debits equal credits.\n\nFor the concurrency story run `./gradlew test` (200 concurrent transfers over 4 accounts), then hit `Reconcile` and look at `retriesAbsorbed`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Accounts",
+      "description": "Account projections. Balances here are a cached view; the event log is the source of truth.",
+      "item": [
+        {
+          "name": "List accounts (paginated)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts?page=0&size=20&sort=id,asc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "20"
+                },
+                {
+                  "key": "sort",
+                  "value": "id,asc"
+                }
+              ]
+            },
+            "description": "Paginated list of accounts as DTOs. Run this first: it captures the seeded account ids into collection variables that every other request uses."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const page = pm.response.json();",
+                  "pm.test('page has content', () => pm.expect(page.content).to.be.an('array').that.is.not.empty);",
+                  "",
+                  "// Seed the ids the rest of the collection transfers between.",
+                  "pm.collectionVariables.set('fromAccountId', page.content[0].id);",
+                  "pm.collectionVariables.set('toAccountId', page.content[1].id);",
+                  "pm.collectionVariables.set('fromAccountBalance', page.content[0].balance);",
+                  "",
+                  "console.log('from=' + page.content[0].id + ' to=' + page.content[1].id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Open a new account",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts"
+              ]
+            },
+            "description": "Creates an account. The opening balance is written to the event log as an OPENING event in the same transaction, which is what lets /reconcile derive this account's balance from history alone.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Eve\",\n  \"openingBalance\": \"640.00\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('returns a Location header', () =>",
+                  "    pm.expect(pm.response.headers.get('Location')).to.be.a('string'));",
+                  "",
+                  "const a = pm.response.json();",
+                  "pm.collectionVariables.set('newAccountId', a.id);",
+                  "pm.test('opens with the requested balance', () =>",
+                  "    pm.expect(Number(a.balance)).to.eql(640));",
+                  "pm.test('starts at version 0', () => pm.expect(a.version).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Open account - negative opening balance (400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts"
+              ]
+            },
+            "description": "Opening balances may be zero but never negative - the ledger has no overdraft concept.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Bad\",\n  \"openingBalance\": \"-1.00\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('VALIDATION_FAILED', () => pm.expect(pm.response.json().errorCode).to.eql('VALIDATION_FAILED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Account event history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts/{{fromAccountId}}/events?page=0&size=50&sort=id,desc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts",
+                "{{fromAccountId}}",
+                "events"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "50"
+                },
+                {
+                  "key": "sort",
+                  "value": "id,desc"
+                }
+              ]
+            },
+            "description": "This account's slice of the event log - the history its balance is folded from. A newly opened account shows exactly one OPENING event."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const page = pm.response.json();",
+                  "pm.test('every event belongs to this account', () =>",
+                  "    page.content.forEach(e =>",
+                  "        pm.expect(String(e.accountId)).to.eql(String(pm.collectionVariables.get('fromAccountId')))));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Account event history - unknown account (404)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts/999999/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts",
+                "999999",
+                "events"
+              ]
+            },
+            "description": "An unknown account 404s rather than returning a misleadingly empty page."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('ACCOUNT_NOT_FOUND', () => pm.expect(pm.response.json().errorCode).to.eql('ACCOUNT_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get account by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts/{{fromAccountId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts",
+                "{{fromAccountId}}"
+              ]
+            },
+            "description": "Single account. The `version` field is the @Version column driving optimistic locking - watch it climb as transfers commit against this account."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const a = pm.response.json();",
+                  "pm.test('has a version', () => pm.expect(a.version).to.be.a('number'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get account by id - not found (404)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/accounts/999999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "accounts",
+                "999999"
+              ]
+            },
+            "description": "Unknown account id. Expect 404 with errorCode ACCOUNT_NOT_FOUND."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('ACCOUNT_NOT_FOUND', () => pm.expect(pm.response.json().errorCode).to.eql('ACCOUNT_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Transfers",
+      "description": "The write path. Every accepted transfer appends a DEBIT and a matching CREDIT event sharing one transferId, and records its idempotency key in the same transaction.",
+      "item": [
+        {
+          "name": "Transfer money",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Moves money. The pre-request script mints a fresh idempotencyId and stores it, so the next request ('Replay the same request') can send the exact same payload again.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"100.00\",\n  \"idempotencyId\": \"{{idempotencyId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fresh key per run: a client would normally generate this once per logical transfer",
+                  "// and reuse it across retries.",
+                  "const key = 'pm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);",
+                  "pm.collectionVariables.set('idempotencyId', key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const r = pm.response.json();",
+                  "pm.test('succeeded', () => pm.expect(r.success).to.be.true);",
+                  "pm.test('returns a transferId', () => pm.expect(r.transferId).to.be.a('string'));",
+                  "",
+                  "// Remember the result so the replay request can assert it comes back identical.",
+                  "pm.collectionVariables.set('lastTransferId', r.transferId);",
+                  "pm.collectionVariables.set('lastFromBalance', r.fromBalance);",
+                  "pm.collectionVariables.set('lastToBalance', r.toBalance);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay the same request (idempotency)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Identical payload, identical idempotencyId - no pre-request script, so the key is NOT regenerated. The server returns the original result from processed_request instead of moving money a second time. Send it as many times as you like; the ledger does not change.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"100.00\",\n  \"idempotencyId\": \"{{idempotencyId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const r = pm.response.json();",
+                  "pm.test('same transferId as the original', () =>",
+                  "    pm.expect(r.transferId).to.eql(pm.collectionVariables.get('lastTransferId')));",
+                  "pm.test('same balances as the original', () => {",
+                  "    pm.expect(String(r.fromBalance)).to.eql(String(pm.collectionVariables.get('lastFromBalance')));",
+                  "    pm.expect(String(r.toBalance)).to.eql(String(pm.collectionVariables.get('lastToBalance')));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get transfer by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers/{{lastTransferId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers",
+                "{{lastTransferId}}"
+              ]
+            },
+            "description": "Both legs of one transfer: exactly one DEBIT and one matching CREDIT sharing a transferId. Uses the id captured by 'Transfer money'."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const legs = pm.response.json();",
+                  "pm.test('has exactly two legs', () => pm.expect(legs).to.have.lengthOf(2));",
+                  "pm.test('one DEBIT and one CREDIT', () => {",
+                  "    const types = legs.map(l => l.eventType).sort();",
+                  "    pm.expect(types).to.eql(['CREDIT', 'DEBIT']);",
+                  "});",
+                  "pm.test('both legs move the same amount', () =>",
+                  "    pm.expect(Number(legs[0].amount)).to.eql(Number(legs[1].amount)));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get transfer by id - unknown (404)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Unknown transferId."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('TRANSFER_NOT_FOUND', () => pm.expect(pm.response.json().errorCode).to.eql('TRANSFER_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List transfer events (paginated)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers?page=0&size=50&sort=id,desc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "50"
+                },
+                {
+                  "key": "sort",
+                  "value": "id,desc"
+                }
+              ]
+            },
+            "description": "The event log. Each transfer contributes exactly two rows - one DEBIT, one CREDIT - sharing a transferId. OPENING rows are the seeded starting balances."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const page = pm.response.json();",
+                  "pm.test('events are DEBIT / CREDIT / OPENING', () =>",
+                  "    page.content.forEach(e => pm.expect(['DEBIT', 'CREDIT', 'OPENING']).to.include(e.eventType)));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List processed requests (paginated)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers/processed?page=0&size=50&sort=id,desc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers",
+                "processed"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "50"
+                },
+                {
+                  "key": "sort",
+                  "value": "id,desc"
+                }
+              ]
+            },
+            "description": "The idempotency records. One row per accepted idempotencyId, holding the result that gets replayed on a retry. The unique constraint on idempotency_id is what makes this safe under concurrency."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Reconciliation",
+      "description": "The headline proof. Recomputes every balance from the event log and checks that money was only ever moved, never created or destroyed.",
+      "item": [
+        {
+          "name": "Reconcile the ledger",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/reconcile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "reconcile"
+              ]
+            },
+            "description": "200 when the ledger balances, 409 when it does not - so this doubles as a CI assertion.\n\n`discrepancies` lists any account whose stored balance disagrees with its event history (should always be empty). `totalDebited` must equal `totalCredited`. `retriesAbsorbed` and `idempotentReplays` are live counters - run the stress test, then hit this to see them climb."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK - the ledger balances', () => pm.response.to.have.status(200));",
+                  "",
+                  "const r = pm.response.json();",
+                  "pm.test('no account disagrees with its event history', () =>",
+                  "    pm.expect(r.discrepancies).to.be.an('array').that.is.empty);",
+                  "pm.test('no money created or destroyed', () => {",
+                  "    pm.expect(r.conserved).to.be.true;",
+                  "    pm.expect(Number(r.totalDebited)).to.eql(Number(r.totalCredited));",
+                  "});",
+                  "pm.test('stored total matches derived total', () =>",
+                  "    pm.expect(Number(r.storedTotal)).to.eql(Number(r.derivedTotal)));",
+                  "",
+                  "console.log('accounts=' + r.accountsChecked +",
+                  "            ' transfers=' + r.transfersRecorded +",
+                  "            ' retriesAbsorbed=' + r.retriesAbsorbed +",
+                  "            ' idempotentReplays=' + r.idempotentReplays);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Error cases",
+      "description": "Every failure mode returns the same {errorCode, message} shape from GlobalExceptionHandler. Nothing is written to the ledger for any of these.",
+      "item": [
+        {
+          "name": "Self transfer (400 SELF_TRANSFER)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Same account on both sides. Rejected before any work happens - otherwise it would append a meaningless DEBIT/CREDIT pair against one account.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{fromAccountId}}\",\n  \"amount\": \"5.00\",\n  \"idempotencyId\": \"pm-self-{{$randomUUID}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('SELF_TRANSFER', () => pm.expect(pm.response.json().errorCode).to.eql('SELF_TRANSFER'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Idempotency key reused with different parameters (409)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Sends the key from 'Transfer money' again, but with a different amount. The server refuses rather than replaying the original result - returning the 100.00 result for a 500.00 request would silently swallow a client bug. Run 'Transfer money' first.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"500.00\",\n  \"idempotencyId\": \"{{idempotencyId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('IDEMPOTENCY_KEY_REUSED', () =>",
+                  "    pm.expect(pm.response.json().errorCode).to.eql('IDEMPOTENCY_KEY_REUSED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Insufficient funds (409 INSUFFICIENT_FUNDS)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "More than the account holds. The invariant lives on the Account entity itself (Account.debit), not in the service, so it cannot be bypassed by a new caller.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"99999999.00\",\n  \"idempotencyId\": \"pm-funds-{{$randomUUID}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('INSUFFICIENT_FUNDS', () => pm.expect(pm.response.json().errorCode).to.eql('INSUFFICIENT_FUNDS'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown account (404 ACCOUNT_NOT_FOUND)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Sender does not exist.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": 999999,\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"10.00\",\n  \"idempotencyId\": \"pm-missing-{{$randomUUID}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('ACCOUNT_NOT_FOUND', () => pm.expect(pm.response.json().errorCode).to.eql('ACCOUNT_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Negative amount (400 VALIDATION_FAILED)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "Caught by @Positive on the DTO, so it never reaches the service. Note this means the domain's own InvalidAmountException (INVALID_AMOUNT) is unreachable over HTTP - it is the second line of defence for any non-HTTP caller.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"-50.00\",\n  \"idempotencyId\": \"pm-negative-{{$randomUUID}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('VALIDATION_FAILED', () => pm.expect(pm.response.json().errorCode).to.eql('VALIDATION_FAILED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Missing idempotencyId (400 VALIDATION_FAILED)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "@NotBlank. Without a key there is no way to make a retry safe, so the request is refused.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"10.00\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "const b = pm.response.json();",
+                  "pm.test('VALIDATION_FAILED', () => pm.expect(b.errorCode).to.eql('VALIDATION_FAILED'));",
+                  "pm.test('names the offending field', () => pm.expect(b.message).to.include('idempotencyId'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Too many decimal places (400 VALIDATION_FAILED)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/transfers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "transfers"
+              ]
+            },
+            "description": "@Digits(integer = 15, fraction = 4). Money columns are DECIMAL(19,4); anything finer would be silently rounded on the way in, so it is rejected instead.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromId\": \"{{fromAccountId}}\",\n  \"toId\": \"{{toAccountId}}\",\n  \"amount\": \"10.000001\",\n  \"idempotencyId\": \"pm-scale-{{$randomUUID}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('VALIDATION_FAILED', () => pm.expect(pm.response.json().errorCode).to.eql('VALIDATION_FAILED'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Operations",
+      "description": "Actuator endpoints. Only health, info and metrics are exposed.",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            },
+            "description": "Liveness/readiness for the app and its datasource."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('status UP', () => pm.expect(pm.response.json().status).to.eql('UP'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Metric - retries absorbed",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/ledgerly.transfer.retries",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "ledgerly.transfer.retries"
+              ]
+            },
+            "description": "Optimistic-lock conflicts detected and retried. Run the stress test (`./gradlew test`) and watch this climb."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const m = pm.response.json();",
+                  "console.log(m.name + ' = ' + m.measurements[0].value);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Metric - idempotent replays",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/ledgerly.transfer.idempotent.replays",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "ledgerly.transfer.idempotent.replays"
+              ]
+            },
+            "description": "Requests answered from the idempotency cache instead of re-executing."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const m = pm.response.json();",
+                  "console.log(m.name + ' = ' + m.measurements[0].value);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "fromAccountId",
+      "value": "1",
+      "type": "string"
+    },
+    {
+      "key": "toAccountId",
+      "value": "2",
+      "type": "string"
+    },
+    {
+      "key": "idempotencyId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "lastTransferId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "lastFromBalance",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "lastToBalance",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "fromAccountBalance",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "newAccountId",
+      "value": "",
+      "type": "string"
+    }
+  ]
+}

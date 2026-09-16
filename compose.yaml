@@ -1,0 +1,41 @@
+# Runs Ledgerly against PostgreSQL instead of the default in-memory H2.
+#
+#   cp .env.example .env     # then edit .env
+#   docker compose up --build
+#
+# Without an .env file the defaults below are used. They are local-development
+# values only -- never deploy this compose file as-is.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerly}
+      POSTGRES_USER: ${POSTGRES_USER:-ledgerly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ledgerly-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ledgerly} -d ${POSTGRES_DB:-ledgerly}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-ledgerly}
+      DB_USERNAME: ${POSTGRES_USER:-ledgerly}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      # `update` rather than the H2 default of `create-drop`, so the ledger survives
+      # a restart. Use schema migrations for anything beyond local experimentation.
+      DDL_AUTO: update
+    ports:
+      - "${APP_PORT:-8080}:8080"
+
+volumes:
+  ledgerly-db:
