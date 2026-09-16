@@ -40,16 +40,83 @@ that proves each one actually fires rather than merely existing.
 
 ## The problem
 
-Transferring money between two accounts looks trivial until two transfers touch the same
-account at the same instant. The naive version reads a balance, subtracts, and writes it
-back — and under concurrency, two requests read the same starting balance and one of the
-writes is silently lost. Money is created or destroyed.
+Moving money between two accounts looks trivial:
 
-Retries make it worse. A client whose connection drops doesn't know whether the transfer
-happened, so it retries, and the money moves twice.
+```java
+from.setBalance(from.getBalance().subtract(amount));
+to.setBalance(to.getBalance().add(amount));
+```
 
-Ledgerly addresses both, and then proves the result: every balance is checkable against an
-immutable log of everything that ever happened to it.
+That code is correct exactly once — when nothing else is running. Put it under concurrent
+load and it breaks in two different ways, both of which destroy or invent money silently,
+with no exception, no error log, and no failed request.
+
+### Problem 1: the lost update
+
+Two requests try to send 100 from Alice at the same moment. Each reads her balance before
+the other has written:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Request A
+    participant DB as Alice's balance
+    participant B as Request B
+    A->>DB: read balance = 1000
+    B->>DB: read balance = 1000
+    A->>DB: write 1000 - 100 = 900
+    B->>DB: write 1000 - 100 = 900
+    Note over DB: Alice's balance is 900.<br/>But 200 was sent. 100 appeared from nowhere.
+```
+
+Both requests succeeded. Both recipients were credited. Alice paid once. The ledger is now
+wrong by 100, and nothing in the system knows it.
+
+This is a **lost update**: B's write was computed from a balance that was already stale by
+the time it landed. The window is microseconds wide, which is why it survives casual testing
+and shows up in production.
+
+### Problem 2: the duplicate request
+
+A client sends a transfer. The connection drops before the response arrives. The client has
+no way to know whether the money moved, so it does the only sensible thing and retries:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server
+    C->>S: transfer 100
+    S->>S: money moves
+    S--xC: response lost in transit
+    Note over C: Did that go through?<br/>No way to tell. Retry.
+    C->>S: transfer 100
+    S->>S: money moves again
+```
+
+The server behaved correctly both times. The client behaved correctly both times. The
+customer was charged twice.
+
+### Problem 3: how would you even know?
+
+The first two problems share a nastier property: **they are invisible.** A balance column
+holds a number. If that number is wrong, nothing about it looks wrong. There is no checksum,
+no second opinion, nothing to compare against. A ledger that can silently drift from reality
+and never tell you is worse than useless — it is confidently wrong.
+
+### What Ledgerly does about it
+
+Three patterns, each aimed at one of the above:
+
+| Problem | Pattern | Effect |
+| --- | --- | --- |
+| Lost update | Optimistic concurrency control | One writer wins, the other retries on fresh state |
+| Duplicate request | Idempotency keys | The retry replays the original result instead of re-executing |
+| Invisible drift | Event sourcing | Every balance is recomputable from history and checked on demand |
+
+The first two are *preventive* — they stop bad writes. The third is *detective* — it assumes
+something might still slip through and gives you a way to find out. That's the important one:
+reconciliation is the only mechanism here that can catch a bug in the other two.
 
 ---
 
@@ -92,6 +159,38 @@ nothing.
 
 ## How it works
 
+### Request path, and where the transaction boundary sits
+
+This shape is the single most important design decision in the project, and the least
+obvious. The retry loop lives *outside* the transaction, in a different bean:
+
+```mermaid
+flowchart TD
+    C["TransferController<br/><i>POST /api/v1/transfers</i>"]
+    S["TransferService<br/><i>retry loop, no transaction</i>"]
+    C --> S
+    S --> E
+    subgraph TX ["one transaction — commits or rolls back together"]
+        direction TB
+        E["TransferExecutor<br/><i>re-reads both accounts</i>"]
+        W["debit · credit · two events · idempotency row"]
+        E --> W
+    end
+    W -. retry .-> S
+```
+
+Two Spring mechanics force that layout, and getting either wrong removes a guarantee
+without producing any error:
+
+- **`@Transactional` is proxy-based.** Spring wraps the *bean*, so a call from one method of
+  a class to another method of the same class never passes through the proxy and the
+  annotation does nothing at all — silently. That is why `TransferExecutor` is a separate
+  bean rather than another method on `TransferService`.
+- **The conflict surfaces at commit.** An optimistic-lock failure isn't thrown by your code;
+  it's thrown when the transaction commits, inside the proxy, *after* `executeOnce()` has
+  already returned. A `try/catch` placed inside the executor would never see it, so the retry
+  loop has to sit outside the boundary.
+
 ### 1. Event sourcing
 
 Every movement of money appends immutable `TransferEvent` rows — one `DEBIT` and one
@@ -113,8 +212,25 @@ which stores `0`/`1` and would silently rewrite history the moment someone reord
 sum(case when event_type = 'DEBIT' then -amount else amount end) group by account_id
 ```
 
+A balance is therefore never trusted — it is recomputed and compared:
+
+```mermaid
+flowchart LR
+    O["OPENING<br/>+1000.00"] --> F
+    D["DEBIT<br/>-100.00"] --> F
+    R["CREDIT<br/>+40.00"] --> F
+    F["fold in SQL<br/><i>sum of signed amounts</i>"] --> B["derived balance<br/><b>940.00</b>"]
+    B --> V{"equals the stored<br/>balance column?"}
+    V -- yes --> OK["200 · ledger balances"]
+    V -- no --> BAD["409 · drift, with the<br/>offending accounts named"]
+```
+
 It returns `200` when the ledger balances and `409` when it does not, so a CI check can
 simply assert the status code.
+
+This is also why opening balances are events rather than just a starting column value. If
+the seed balance existed only on the account row, reconciliation would have to be handed
+that number from outside the log — which would make it a partial check rather than a proof.
 
 ### 2. Optimistic concurrency control
 
@@ -122,6 +238,33 @@ simply assert the status code.
 so when two transfers touch the same account concurrently, exactly one commit wins and the
 other fails with `OptimisticLockingFailureException`. No lost updates, and no row locks held
 across a request.
+
+Replaying the lost update from [The problem](#problem-1-the-lost-update), this time with a
+version column:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Transfer A
+    participant DB as account row
+    participant B as Transfer B
+    A->>DB: read balance 1000, version 7
+    B->>DB: read balance 1000, version 7
+    A->>DB: update ... where version = 7
+    DB-->>A: 1 row matched, version now 8
+    B->>DB: update ... where version = 7
+    DB-->>B: 0 rows matched, conflict raised
+    Note over B: nothing was written, so retry is safe
+    B->>DB: re-read balance 900, version 8
+    B->>DB: update ... where version = 8
+    DB-->>B: 1 row matched, version now 9
+```
+
+Step 7 is the one that's easy to get wrong. The retry **re-reads** — it does not reuse the
+`Account` objects loaded on the first attempt. Reusing them would apply `debit()` a second
+time to an object the first attempt already mutated, computing a new balance from stale
+state. The unit being retried is the *request*, and every attempt loads both accounts fresh
+inside its own transaction.
 
 The retry is a plain loop in `TransferService`, deliberately **not** an annotation:
 
@@ -161,6 +304,19 @@ not by a `findBy…` check. A check-then-act races: under concurrency two thread
 The idempotency record is written **in the same transaction** as the money movement. Saved
 afterwards, a crash in between would leave a committed transfer with no record of it — and
 the client's retry would move the money a second time.
+
+```mermaid
+flowchart TD
+    REQ["request carrying an idempotencyId"] --> Q{"key already<br/>recorded?"}
+    Q -- "no · unique index settles the race" --> NEW["execute the transfer and record<br/>the key in one transaction"]
+    Q -- yes --> FP{"request fingerprint<br/>matches?"}
+    FP -- yes --> REPLAY["200 · replay the stored result"]
+    FP -- no --> REJECT["409 · IDEMPOTENCY_KEY_REUSED"]
+```
+
+Note that *"key already recorded?"* is not answered by a `findBy…` call in application code.
+That would be check-then-act, and two concurrent duplicates would both see nothing and both
+transfer. The database answers it, via the unique index.
 
 Each record also stores a **SHA-256 fingerprint of the request parameters**. Reusing a key
 with *different* parameters returns `409 IDEMPOTENCY_KEY_REUSED` rather than silently
